@@ -46,9 +46,12 @@
 #include "internal-target.h"
 #include "target/arm/syndrome.h"
 
+#include "mach/mach.h"
 #include "mach/vm_map.h"
 #include "mach/mach_init.h"
 #include "mach/mach_error.h"
+#include "mach/task.h"
+#include <spawn.h>
 
 /* -icount align implementation. */
 
@@ -973,70 +976,64 @@ static bool donair_is_ok(CPUState *cpu) {
     return arm_current_el(cpu_env(cpu)) == 0;
 }
 
-static sigjmp_buf donair_sigjmp_buf;
-static CPUState* donair_cpustate;
-
-static void donair_sigtrap_handler(int signal, siginfo_t * siginfo, ucontext_t *uap) {
-    fprintf(stderr, "sigtrap! %llx\n", uap->uc_mcontext->__ss.__pc);
-    CPUState* cpu = donair_cpustate;
-    CPUARMState* env = cpu_env(donair_cpustate);
-    // TODO(zhuowei): moar registers
-    memcpy(&env->xregs[0], uap->uc_mcontext->__ss.__x, sizeof(uap->uc_mcontext->__ss.__x));
-    env->xregs[29] = uap->uc_mcontext->__ss.__fp;
-    env->xregs[30] = uap->uc_mcontext->__ss.__lr;
-    env->pc = uap->uc_mcontext->__ss.__pc + 4;
-
-    // pretend we ran a `svc` instruction
-    cpu->exception_index = EXCP_SWI;
-    env->exception.target_el = 1;
-    env->exception.syndrome = syn_aa64_svc(0);
-
-    longjmp(donair_sigjmp_buf, 1);
-}
-
-__attribute((naked, __noreturn__))
-static void donair_jump_to_code(CPUARMState* env) {
-    // TODO(zhuowei): once we switch to a separate thread/process, this dance would be unnecessary...
-    // genasm.py
-    asm volatile(
-"mov x16, x0\n"
-"ldr x0, [x16, #64]\n"
-"ldr x1, [x16, #72]\n"
-"ldr x2, [x16, #80]\n"
-"ldr x3, [x16, #88]\n"
-"ldr x4, [x16, #96]\n"
-"ldr x5, [x16, #104]\n"
-"ldr x6, [x16, #112]\n"
-"ldr x7, [x16, #120]\n"
-"ldr x8, [x16, #128]\n"
-"ldr x9, [x16, #136]\n"
-"ldr x10, [x16, #144]\n"
-"ldr x11, [x16, #152]\n"
-"ldr x12, [x16, #160]\n"
-"ldr x13, [x16, #168]\n"
-"ldr x14, [x16, #176]\n"
-"ldr x15, [x16, #184]\n"
-"ldr x17, [x16, #200]\n"
-"ldr x18, [x16, #208]\n"
-"ldr x19, [x16, #216]\n"
-"ldr x20, [x16, #224]\n"
-"ldr x21, [x16, #232]\n"
-"ldr x22, [x16, #240]\n"
-"ldr x23, [x16, #248]\n"
-"ldr x24, [x16, #256]\n"
-"ldr x25, [x16, #264]\n"
-"ldr x26, [x16, #272]\n"
-"ldr x27, [x16, #280]\n"
-"ldr x28, [x16, #288]\n"
-"ldr x29, [x16, #296]\n"
-"ldr x30, [x16, #304]\n"
-"ldr x16, [x16, #320]\n"
-"br x16\n"
-    );
-}
-
 uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                        uintptr_t ra, MMUAccessType type);
+
+extern char** environ;
+extern char* const ** _NSGetArgv(void);
+
+static void donair_cpu_state_to_thread_state(CPUARMState* env, arm_thread_state64_t* state) {
+    memcpy(state->__x, &env->xregs, sizeof(state->__x));
+    state->__fp = env->xregs[29];
+    state->__lr = env->xregs[30];
+    // TODO(zhuowei): sp, other regs, fp regs??
+    state->__pc = env->pc;
+}
+
+static void donair_thread_state_to_cpu_state(CPUARMState* env, arm_thread_state64_t* state, uint64_t pc_addend) {
+    memcpy(&env->xregs, state->__x, sizeof(state->__x));
+    env->xregs[29] = state->__fp;
+    env->xregs[30] = state->__lr;
+    // TODO(zhuowei): sp, other regs, fp regs??
+    env->pc = state->__pc + pc_addend;
+}
+static exception_type_t donair_exception_type;
+
+#pragma pack(4)
+typedef struct {
+    mach_msg_header_t Head;
+    mach_msg_body_t msgh_body;
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+    NDR_record_t NDR;
+} exception_raise_request; // the bits we need at least
+
+typedef struct {
+    mach_msg_header_t Head;
+    NDR_record_t NDR;
+    kern_return_t RetCode;
+} exception_raise_reply;
+#pragma pack()
+
+static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_header_t *OutHeadP) {
+    // fprintf(stderr, "donair_exception_server!\n");
+    // TODO(zhuowei)
+    exception_raise_request* req = (exception_raise_request*)InHeadP;
+    donair_exception_type = EXC_BREAKPOINT; // TODO(zhuowei)
+    thread_suspend(req->thread.name);
+
+    // https://github.com/evelyneee/ellekit/blob/95d8baf4d8bae66f211abbe7f5503cdc980ae3f3/ellekit/ExceptionHandler/Exception.swift#L99
+    exception_raise_reply* reply = (exception_raise_reply*)OutHeadP;
+    reply->Head.msgh_bits = req->Head.msgh_bits & MACH_MSGH_BITS_REMOTE_MASK;
+    reply->Head.msgh_size = sizeof(exception_raise_request);
+    reply->Head.msgh_remote_port = req->Head.msgh_remote_port;
+    reply->Head.msgh_local_port = MACH_PORT_NULL;
+    reply->Head.msgh_id = req->Head.msgh_id + 0x64; // ???
+
+    reply->NDR = req->NDR;
+    reply->RetCode = KERN_SUCCESS;
+    return KERN_SUCCESS;
+}
 
 static int donair_cpu_exec(CPUState *cpu) {
     // fprintf(stderr, "donair_cpu_exec!\n");
@@ -1045,11 +1042,60 @@ static int donair_cpu_exec(CPUState *cpu) {
     // catch breakpoint exceptions
     // and jump! (TODO(zhuowei): a new process...)
     // TODO(zhuowei): walk the pagetables, use a separate process
-    static void* pc_map;
+    static task_t target_task;
+    static thread_act_t target_thread;
+    static int target_pid;
+    static mach_port_t exc_port;
+    static bool mapped;
 
     CPUARMState* env = cpu_env(cpu);
 
-    if (!pc_map) {
+    if (!target_task) {
+        // TODO(zhuowei): setsid this so that it gets sighup'd on our exit
+        posix_spawnattr_t spawnattr;
+        posix_spawnattr_init(&spawnattr);
+        posix_spawnattr_setflags(&spawnattr, POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT);
+        char executable_name[1024];
+        uint32_t len = sizeof(executable_name);
+        _NSGetExecutablePath(&executable_name, &len);
+        char* const new_argv[] = {executable_name, NULL};
+        fprintf(stderr, "%s\n", new_argv[0]);
+        if (posix_spawn(&target_pid, new_argv[0], NULL, &spawnattr, new_argv, environ) != 0) {
+            fprintf(stderr, "failed to spawn!\n");
+            exit(1);
+        }
+        if (task_for_pid(mach_task_self_, target_pid, &target_task) != KERN_SUCCESS) {
+            fprintf(stderr, "failed to task for pid!\n");
+            kill(target_pid, SIGKILL);
+            exit(1);
+        }
+        uint32_t num_threads = 0;
+        thread_act_t* threads_array = NULL;
+        if (task_threads(target_task, &threads_array, &num_threads) != KERN_SUCCESS) {
+            fprintf(stderr, "failed to task_threads!\n");
+            kill(target_pid, SIGKILL);
+            exit(1);
+        }
+        // TODO(zhuowei): free?
+        target_thread = threads_array[0];
+        if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &exc_port) != KERN_SUCCESS) {
+            abort();
+        }
+        if (mach_port_insert_right(mach_task_self_, exc_port, exc_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+            abort();
+        }
+        if (thread_set_exception_ports(
+		    target_thread,
+		    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT,
+		    exc_port,
+		    EXCEPTION_DEFAULT,
+		    ARM_THREAD_STATE64) != KERN_SUCCESS) {
+            abort();
+        }
+        thread_suspend(target_thread);
+        task_resume(target_task);
+    }
+    if (!mapped) {
         // TODO(zhuowei): page size needs to be same as host...
         uint64_t pc_haddr = donair_mmu_lookup(cpu, env->pc, make_memop_idx(MO_32, 0), env->pc, MMU_INST_FETCH);
         fprintf(stderr, "translated! %llx %x\n", pc_haddr, *(uint32_t*)pc_haddr);
@@ -1059,7 +1105,7 @@ static int donair_cpu_exec(CPUState *cpu) {
         vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
         vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
         fprintf(stderr, "%lx %llx\n", target_address, pc_haddr_page);
-        kern_return_t err = vm_remap(mach_task_self_, &target_address, 0x4000, /*mask=*/0,
+        kern_return_t err = vm_remap(target_task, &target_address, 0x4000, /*mask=*/0,
                 VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, pc_haddr_page, /*copy=*/false,
                 &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
         if (err != KERN_SUCCESS) {
@@ -1067,26 +1113,48 @@ static int donair_cpu_exec(CPUState *cpu) {
             exit(1);
             return 1;
         }
-        pc_map = (void*)target_address;
-        if (mprotect((void*)target_address, 0x4000, PROT_READ | PROT_EXEC) != 0) {
+        if (vm_protect(target_task, target_address, 0x4000, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
             fprintf(stderr, "fail! mprotect\n");
             exit(1);
             return 1;
         }
-        // setup signals
-        signal(SIGTRAP, (void*)donair_sigtrap_handler);
+        mapped = true;
     }
-    donair_cpustate = cpu;
-    // setup a longjmp context
-    if (setjmp(donair_sigjmp_buf)) {
-        fprintf(stderr, "handled signal\n");
-        return 0;
+    {
+        arm_thread_state64_t state;
+        mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_get_state\n");
+            exit(1);
+        }
+        donair_cpu_state_to_thread_state(env, &state);
+        if (thread_set_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)&state, count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_set_state\n");
+            exit(1);
+        }
+        if (thread_resume(target_thread) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_resume\n");
+            exit(1);
+        }
+        // TODO(zhuowei): is this right?
+        if (mach_msg_server_once(donair_exception_server, 4096, exc_port, 0) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! mach_msg_server_once\n");
+            exit(1);
+        }
+        // fprintf(stderr, "%x\n", donair_exception_type);
+        if (thread_get_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_get_state\n");
+            exit(1);
+        }
+        // fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
+        donair_thread_state_to_cpu_state(env, &state, donair_exception_type == EXC_BREAKPOINT? 4: 0);
+        // pretend we ran a `svc` instruction
+        // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
+        cpu->exception_index = EXCP_SWI;
+        env->exception.target_el = 1;
+        env->exception.syndrome = syn_aa64_svc(0);
     }
-    sigset_t unblock_set;
-    sigemptyset(&unblock_set);
-    sigaddset(&unblock_set, SIGTRAP);
-    pthread_sigmask(SIG_UNBLOCK, &unblock_set, NULL);
-    donair_jump_to_code(env);
+    return 0;
 }
 
 /* main execution loop */
