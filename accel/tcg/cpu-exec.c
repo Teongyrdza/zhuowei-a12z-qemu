@@ -48,6 +48,7 @@
 
 #include "mach/vm_map.h"
 #include "mach/mach_init.h"
+#include "mach/mach_error.h"
 
 /* -icount align implementation. */
 
@@ -976,11 +977,14 @@ static sigjmp_buf donair_sigjmp_buf;
 static CPUState* donair_cpustate;
 
 static void donair_sigtrap_handler(int signal, siginfo_t * siginfo, ucontext_t *uap) {
+    fprintf(stderr, "sigtrap! %llx\n", uap->uc_mcontext->__ss.__pc);
     CPUState* cpu = donair_cpustate;
     CPUARMState* env = cpu_env(donair_cpustate);
-    // TODO(zhuowei): moar registers; currently we only sync x0-x7
-    memcpy(&env->xregs[0], uap->uc_mcontext->__ss.__x, 8 * 8);
-    env->pc = uap->uc_mcontext->__ss.__pc;
+    // TODO(zhuowei): moar registers
+    memcpy(&env->xregs[0], uap->uc_mcontext->__ss.__x, sizeof(uap->uc_mcontext->__ss.__x));
+    env->xregs[29] = uap->uc_mcontext->__ss.__fp;
+    env->xregs[30] = uap->uc_mcontext->__ss.__lr;
+    env->pc = uap->uc_mcontext->__ss.__pc + 4;
 
     // pretend we ran a `svc` instruction
     cpu->exception_index = EXCP_SWI;
@@ -990,10 +994,52 @@ static void donair_sigtrap_handler(int signal, siginfo_t * siginfo, ucontext_t *
     longjmp(donair_sigjmp_buf, 1);
 }
 
+__attribute((naked, __noreturn__))
+static void donair_jump_to_code(CPUARMState* env) {
+    // TODO(zhuowei): once we switch to a separate thread/process, this dance would be unnecessary...
+    // genasm.py
+    asm volatile(
+"mov x16, x0\n"
+"ldr x0, [x16, #64]\n"
+"ldr x1, [x16, #72]\n"
+"ldr x2, [x16, #80]\n"
+"ldr x3, [x16, #88]\n"
+"ldr x4, [x16, #96]\n"
+"ldr x5, [x16, #104]\n"
+"ldr x6, [x16, #112]\n"
+"ldr x7, [x16, #120]\n"
+"ldr x8, [x16, #128]\n"
+"ldr x9, [x16, #136]\n"
+"ldr x10, [x16, #144]\n"
+"ldr x11, [x16, #152]\n"
+"ldr x12, [x16, #160]\n"
+"ldr x13, [x16, #168]\n"
+"ldr x14, [x16, #176]\n"
+"ldr x15, [x16, #184]\n"
+"ldr x17, [x16, #200]\n"
+"ldr x18, [x16, #208]\n"
+"ldr x19, [x16, #216]\n"
+"ldr x20, [x16, #224]\n"
+"ldr x21, [x16, #232]\n"
+"ldr x22, [x16, #240]\n"
+"ldr x23, [x16, #248]\n"
+"ldr x24, [x16, #256]\n"
+"ldr x25, [x16, #264]\n"
+"ldr x26, [x16, #272]\n"
+"ldr x27, [x16, #280]\n"
+"ldr x28, [x16, #288]\n"
+"ldr x29, [x16, #296]\n"
+"ldr x30, [x16, #304]\n"
+"ldr x16, [x16, #320]\n"
+"br x16\n"
+    );
+}
+
 uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                        uintptr_t ra, MMUAccessType type);
 
 static int donair_cpu_exec(CPUState *cpu) {
+    // fprintf(stderr, "donair_cpu_exec!\n");
     // extremely dumb:
     // map just the page around pc into our process (TODO(zhuowei): a new process?)
     // catch breakpoint exceptions
@@ -1006,15 +1052,24 @@ static int donair_cpu_exec(CPUState *cpu) {
     if (!pc_map) {
         // TODO(zhuowei): page size needs to be same as host...
         uint64_t pc_haddr = donair_mmu_lookup(cpu, env->pc, make_memop_idx(MO_32, 0), env->pc, MMU_INST_FETCH);
+        fprintf(stderr, "translated! %llx %x\n", pc_haddr, *(uint32_t*)pc_haddr);
         uint64_t pc_haddr_page = pc_haddr & ~0x3fffull;
         uint64_t pc_virt_page = env->pc & ~0x3fffull;
         vm_address_t target_address = pc_virt_page;
-        vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_EXECUTE;
+        vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
         vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
-        fprintf(stderr, "%lx %lx\n", target_address, pc_haddr_page);
-        sleep(100000);
-        if (vm_remap(mach_task_self_, &target_address, 0x4000, /*mask=*/0, VM_FLAGS_FIXED, mach_task_self_, pc_haddr_page, /*copy=*/false, &cur_protection, &max_protection, VM_INHERIT_DEFAULT) != KERN_SUCCESS) {
-            fprintf(stderr, "fail!\n");
+        fprintf(stderr, "%lx %llx\n", target_address, pc_haddr_page);
+        kern_return_t err = vm_remap(mach_task_self_, &target_address, 0x4000, /*mask=*/0,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, pc_haddr_page, /*copy=*/false,
+                &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
+        if (err != KERN_SUCCESS) {
+            fprintf(stderr, "fail! %s\n", mach_error_string(err));
+            exit(1);
+            return 1;
+        }
+        pc_map = (void*)target_address;
+        if (mprotect((void*)target_address, 0x4000, PROT_READ | PROT_EXEC) != 0) {
+            fprintf(stderr, "fail! mprotect\n");
             exit(1);
             return 1;
         }
@@ -1024,12 +1079,14 @@ static int donair_cpu_exec(CPUState *cpu) {
     donair_cpustate = cpu;
     // setup a longjmp context
     if (setjmp(donair_sigjmp_buf)) {
+        fprintf(stderr, "handled signal\n");
         return 0;
     }
-    // TODO(zhuowei): properly trampoline here - we don't preserve the high registers at all...
-    void (*target)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = (void*)env->pc;
-    target(env->xregs[0], env->xregs[1], env->xregs[2], env->xregs[3], env->xregs[4], env->xregs[5], env->xregs[6], env->xregs[7]);
-    return 0;
+    sigset_t unblock_set;
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, SIGTRAP);
+    pthread_sigmask(SIG_UNBLOCK, &unblock_set, NULL);
+    donair_jump_to_code(env);
 }
 
 /* main execution loop */

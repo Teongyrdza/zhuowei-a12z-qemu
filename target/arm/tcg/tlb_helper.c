@@ -343,6 +343,7 @@ bool arm_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     } else if (probe) {
         return false;
     } else {
+        fprintf(stderr, "fault! %llx\n", address);
         /* now we have a real cpu fault */
         cpu_restore_state(cs, retaddr);
         arm_deliver_fault(cpu, address, access_type, mmu_idx, fi);
