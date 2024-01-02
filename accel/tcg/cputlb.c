@@ -3004,3 +3004,14 @@ uint64_t cpu_ldq_code_mmu(CPUArchState *env, abi_ptr addr,
 {
     return do_ld8_mmu(env_cpu(env), addr, oi, retaddr, MMU_INST_FETCH);
 }
+
+uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                       uintptr_t ra, MMUAccessType type) {
+    MMULookupLocals l;
+    bool crosspage = mmu_lookup(cpu, addr, oi, ra, type, &l);
+    if (crosspage) {
+        fprintf(stderr, "unaligned?!\n");
+        abort();
+    }
+    return l.page[0].haddr;
+}

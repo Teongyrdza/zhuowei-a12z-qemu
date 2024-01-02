@@ -46,6 +46,9 @@
 #include "internal-target.h"
 #include "target/arm/syndrome.h"
 
+#include "mach/vm_map.h"
+#include "mach/mach_init.h"
+
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -964,6 +967,71 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 void helper_stq_mmu(CPUArchState *env, uint64_t addr, uint64_t val,
                     MemOpIdx oi, uintptr_t retaddr);
 
+static bool donair_is_ok(CPUState *cpu) {
+    // see kqemu_is_ok...
+    return arm_current_el(cpu_env(cpu)) == 0;
+}
+
+static sigjmp_buf donair_sigjmp_buf;
+static CPUState* donair_cpustate;
+
+static void donair_sigtrap_handler(int signal, siginfo_t * siginfo, ucontext_t *uap) {
+    CPUState* cpu = donair_cpustate;
+    CPUARMState* env = cpu_env(donair_cpustate);
+    // TODO(zhuowei): moar registers; currently we only sync x0-x7
+    memcpy(&env->xregs[0], uap->uc_mcontext->__ss.__x, 8 * 8);
+    env->pc = uap->uc_mcontext->__ss.__pc;
+
+    // pretend we ran a `svc` instruction
+    cpu->exception_index = EXCP_SWI;
+    env->exception.target_el = 1;
+    env->exception.syndrome = syn_aa64_svc(0);
+
+    longjmp(donair_sigjmp_buf, 1);
+}
+
+uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
+                       uintptr_t ra, MMUAccessType type);
+
+static int donair_cpu_exec(CPUState *cpu) {
+    // extremely dumb:
+    // map just the page around pc into our process (TODO(zhuowei): a new process?)
+    // catch breakpoint exceptions
+    // and jump! (TODO(zhuowei): a new process...)
+    // TODO(zhuowei): walk the pagetables, use a separate process
+    static void* pc_map;
+
+    CPUARMState* env = cpu_env(cpu);
+
+    if (!pc_map) {
+        // TODO(zhuowei): page size needs to be same as host...
+        uint64_t pc_haddr = donair_mmu_lookup(cpu, env->pc, make_memop_idx(MO_32, 0), env->pc, MMU_INST_FETCH);
+        uint64_t pc_haddr_page = pc_haddr & ~0x3fffull;
+        uint64_t pc_virt_page = env->pc & ~0x3fffull;
+        vm_address_t target_address = pc_virt_page;
+        vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_EXECUTE;
+        vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+        fprintf(stderr, "%lx %lx\n", target_address, pc_haddr_page);
+        sleep(100000);
+        if (vm_remap(mach_task_self_, &target_address, 0x4000, /*mask=*/0, VM_FLAGS_FIXED, mach_task_self_, pc_haddr_page, /*copy=*/false, &cur_protection, &max_protection, VM_INHERIT_DEFAULT) != KERN_SUCCESS) {
+            fprintf(stderr, "fail!\n");
+            exit(1);
+            return 1;
+        }
+        // setup signals
+        signal(SIGTRAP, (void*)donair_sigtrap_handler);
+    }
+    donair_cpustate = cpu;
+    // setup a longjmp context
+    if (setjmp(donair_sigjmp_buf)) {
+        return 0;
+    }
+    // TODO(zhuowei): properly trampoline here - we don't preserve the high registers at all...
+    void (*target)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = (void*)env->pc;
+    target(env->xregs[0], env->xregs[1], env->xregs[2], env->xregs[3], env->xregs[4], env->xregs[5], env->xregs[6], env->xregs[7]);
+    return 0;
+}
+
 /* main execution loop */
 
 static int __attribute__((noinline))
@@ -978,33 +1046,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
             // zhuowei: hack hack hack
-            if (arm_current_el(cpu_env(cpu)) == 0) {
-                fprintf(stderr, "we're in userspace\n");
-                CPUARMState* env = cpu_env(cpu);
-                // manual syscall...
-                // TODO(zhuowei): single step? see trans_SVC, raise_exception
-                if (env->xregs[9] != 0x1234) {
-                    // print "Hello!!\n"
-                    fprintf(stderr, "trying to make a call! %llx\n", env->xregs[31]);
-                    // *sp = 'Hello!!\n';
-                    helper_stq_mmu(env, env->xregs[31], 0x0a21216f6c6c6548, make_memop_idx(MO_64, 0), env->pc);
-                    // write(stdout, sp, 8);
-                    env->xregs[0] = 1; // stdout
-                    env->xregs[1] = env->xregs[31];
-                    env->xregs[2] = 8;
-                    env->xregs[8] = 64; // write
-                    env->xregs[9] = 0x1234;
-                    cpu->exception_index = EXCP_SWI;
-                    env->exception.syndrome = syn_aa64_svc(0);
-                    env->exception.target_el = 1;
-                } else {
-                    // exit(0)
-                    env->xregs[0] = 42;
-                    env->xregs[8] = 93; // exit
-                    cpu->exception_index = EXCP_SWI;
-                    env->exception.syndrome = syn_aa64_svc(0);
-                    env->exception.target_el = 1;
-                }
+            if (donair_is_ok(cpu)) {
+                donair_cpu_exec(cpu);
+                // TODO(zhuowei): check retval...
                 break;
             }
             TranslationBlock *tb;
