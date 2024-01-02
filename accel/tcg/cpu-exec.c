@@ -44,6 +44,7 @@
 #include "tb-context.h"
 #include "internal-common.h"
 #include "internal-target.h"
+#include "target/arm/syndrome.h"
 
 /* -icount align implementation. */
 
@@ -972,6 +973,19 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
         int tb_exit = 0;
 
         while (!cpu_handle_interrupt(cpu, &last_tb)) {
+            // zhuowei: hack hack hack
+            if (arm_current_el(cpu_env(cpu)) == 0) {
+                fprintf(stderr, "we're in userspace\n");
+                // manual syscall...
+                // TODO(zhuowei): single step? see trans_SVC, raise_exception
+                CPUARMState* env = cpu_env(cpu);
+                env->xregs[0] = 42;
+                env->xregs[8] = 93; // exit
+                cpu->exception_index = EXCP_SWI;
+                env->exception.syndrome = syn_aa64_svc(0);
+                env->exception.target_el = 1;
+                break;
+            }
             TranslationBlock *tb;
             vaddr pc;
             uint64_t cs_base;
