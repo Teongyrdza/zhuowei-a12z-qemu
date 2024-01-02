@@ -960,6 +960,10 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 #endif
 }
 
+// zhuowei
+void helper_stq_mmu(CPUArchState *env, uint64_t addr, uint64_t val,
+                    MemOpIdx oi, uintptr_t retaddr);
+
 /* main execution loop */
 
 static int __attribute__((noinline))
@@ -976,14 +980,31 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             // zhuowei: hack hack hack
             if (arm_current_el(cpu_env(cpu)) == 0) {
                 fprintf(stderr, "we're in userspace\n");
+                CPUARMState* env = cpu_env(cpu);
                 // manual syscall...
                 // TODO(zhuowei): single step? see trans_SVC, raise_exception
-                CPUARMState* env = cpu_env(cpu);
-                env->xregs[0] = 42;
-                env->xregs[8] = 93; // exit
-                cpu->exception_index = EXCP_SWI;
-                env->exception.syndrome = syn_aa64_svc(0);
-                env->exception.target_el = 1;
+                if (env->xregs[9] != 0x1234) {
+                    // print "Hello!!\n"
+                    fprintf(stderr, "trying to make a call! %llx\n", env->xregs[31]);
+                    // *sp = 'Hello!!\n';
+                    helper_stq_mmu(env, env->xregs[31], 0x0a21216f6c6c6548, make_memop_idx(MO_64, 0), env->pc);
+                    // write(stdout, sp, 8);
+                    env->xregs[0] = 1; // stdout
+                    env->xregs[1] = env->xregs[31];
+                    env->xregs[2] = 8;
+                    env->xregs[8] = 64; // write
+                    env->xregs[9] = 0x1234;
+                    cpu->exception_index = EXCP_SWI;
+                    env->exception.syndrome = syn_aa64_svc(0);
+                    env->exception.target_el = 1;
+                } else {
+                    // exit(0)
+                    env->xregs[0] = 42;
+                    env->xregs[8] = 93; // exit
+                    cpu->exception_index = EXCP_SWI;
+                    env->exception.syndrome = syn_aa64_svc(0);
+                    env->exception.target_el = 1;
+                }
                 break;
             }
             TranslationBlock *tb;
