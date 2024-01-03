@@ -1008,6 +1008,9 @@ typedef struct {
     mach_msg_port_descriptor_t thread;
     mach_msg_port_descriptor_t task;
     NDR_record_t NDR;
+    uint32_t exception;
+    uint32_t codeCnt;
+    uint32_t code[2];
 } exception_raise_request; // the bits we need at least
 
 typedef struct {
@@ -1021,8 +1024,14 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     // fprintf(stderr, "donair_exception_server!\n");
     // TODO(zhuowei)
     exception_raise_request* req = (exception_raise_request*)InHeadP;
-    donair_exception_type = EXC_BREAKPOINT; // TODO(zhuowei)
+    donair_exception_type = req->exception; // TODO(zhuowei)
     thread_suspend(req->thread.name);
+
+    fprintf(stderr, "donair_exception_server! %x %lx exception=%x codeCnt=%x code[0]=%x code[1]=%x\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->codeCnt, req->code[0], req->code[1]);
+
+    if (req->exception != EXC_BREAKPOINT) {
+        exit(0);
+    }
 
     // https://github.com/evelyneee/ellekit/blob/95d8baf4d8bae66f211abbe7f5503cdc980ae3f3/ellekit/ExceptionHandler/Exception.swift#L99
     exception_raise_reply* reply = (exception_raise_reply*)OutHeadP;
@@ -1046,8 +1055,8 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
     uint64_t page_size = PAGE_SIZE;
     uint64_t page_mask = page_size - 1;
-    uint64_t haddr_page = haddr & ~page_size;
-    uint64_t virt_page = address & ~page_size;
+    uint64_t haddr_page = haddr & ~page_mask;
+    uint64_t virt_page = address & ~page_mask;
     vm_address_t target_address = virt_page;
     vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
     vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
