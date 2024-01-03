@@ -977,7 +977,7 @@ static bool donair_is_ok(CPUState *cpu) {
 }
 
 uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
-                       uintptr_t ra, MMUAccessType type);
+                       uintptr_t ra, MMUAccessType type, int* flags_out);
 
 extern char** environ;
 extern char* const ** _NSGetArgv(void);
@@ -986,7 +986,8 @@ static void donair_cpu_state_to_thread_state(CPUARMState* env, arm_thread_state6
     memcpy(state->__x, &env->xregs, sizeof(state->__x));
     state->__fp = env->xregs[29];
     state->__lr = env->xregs[30];
-    // TODO(zhuowei): sp, other regs, fp regs??
+    state->__sp = env->xregs[31];
+    // TODO(zhuowei): other regs, fp regs??
     state->__pc = env->pc;
 }
 
@@ -994,7 +995,8 @@ static void donair_thread_state_to_cpu_state(CPUARMState* env, arm_thread_state6
     memcpy(&env->xregs, state->__x, sizeof(state->__x));
     env->xregs[29] = state->__fp;
     env->xregs[30] = state->__lr;
-    // TODO(zhuowei): sp, other regs, fp regs??
+    // TODO(zhuowei): other regs, fp regs??
+    env->xregs[31] = state->__sp;
     env->pc = state->__pc + pc_addend;
 }
 static exception_type_t donair_exception_type;
@@ -1025,7 +1027,7 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     // https://github.com/evelyneee/ellekit/blob/95d8baf4d8bae66f211abbe7f5503cdc980ae3f3/ellekit/ExceptionHandler/Exception.swift#L99
     exception_raise_reply* reply = (exception_raise_reply*)OutHeadP;
     reply->Head.msgh_bits = req->Head.msgh_bits & MACH_MSGH_BITS_REMOTE_MASK;
-    reply->Head.msgh_size = sizeof(exception_raise_request);
+    reply->Head.msgh_size = sizeof(exception_raise_reply);
     reply->Head.msgh_remote_port = req->Head.msgh_remote_port;
     reply->Head.msgh_local_port = MACH_PORT_NULL;
     reply->Head.msgh_id = req->Head.msgh_id + 0x64; // ???
@@ -1033,6 +1035,41 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     reply->NDR = req->NDR;
     reply->RetCode = KERN_SUCCESS;
     return KERN_SUCCESS;
+}
+
+static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx, uint32_t lookup_type, task_t target_task) {
+    CPUARMState* env = cpu_env(cpu);
+    // TODO(zhuowei): page size needs to be same as host...
+    // TODO(zhuowei): page permissions...
+    int flags = 0;
+    uint64_t haddr = donair_mmu_lookup(cpu, address, memop_idx, env->pc, lookup_type, &flags);
+    fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
+    uint64_t page_size = PAGE_SIZE;
+    uint64_t page_mask = page_size - 1;
+    uint64_t haddr_page = haddr & ~page_size;
+    uint64_t virt_page = address & ~page_size;
+    vm_address_t target_address = virt_page;
+    vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
+    vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+    fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
+    kern_return_t err = vm_remap(target_task, &target_address, 0x4000, /*mask=*/0,
+            VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
+            &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
+    if (err != KERN_SUCCESS) {
+        fprintf(stderr, "fail! %s\n", mach_error_string(err));
+        exit(1);
+        return 1;
+    }
+    // TODO(zhuowei): set permissions properly!
+    if (lookup_type == MMU_INST_FETCH) {
+        // Hack: everything is executable!
+        if (vm_protect(target_task, target_address, 0x4000, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
+            fprintf(stderr, "fail! mprotect\n");
+            exit(1);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int donair_cpu_exec(CPUState *cpu) {
@@ -1093,31 +1130,16 @@ static int donair_cpu_exec(CPUState *cpu) {
             abort();
         }
         thread_suspend(target_thread);
+        fprintf(stderr, "pid %d\n", target_pid);
         task_resume(target_task);
     }
     if (!mapped) {
-        // TODO(zhuowei): page size needs to be same as host...
-        uint64_t pc_haddr = donair_mmu_lookup(cpu, env->pc, make_memop_idx(MO_32, 0), env->pc, MMU_INST_FETCH);
-        fprintf(stderr, "translated! %llx %x\n", pc_haddr, *(uint32_t*)pc_haddr);
-        uint64_t pc_haddr_page = pc_haddr & ~0x3fffull;
-        uint64_t pc_virt_page = env->pc & ~0x3fffull;
-        vm_address_t target_address = pc_virt_page;
-        vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
-        vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
-        fprintf(stderr, "%lx %llx\n", target_address, pc_haddr_page);
-        kern_return_t err = vm_remap(target_task, &target_address, 0x4000, /*mask=*/0,
-                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, pc_haddr_page, /*copy=*/false,
-                &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
-        if (err != KERN_SUCCESS) {
-            fprintf(stderr, "fail! %s\n", mach_error_string(err));
-            exit(1);
-            return 1;
-        }
-        if (vm_protect(target_task, target_address, 0x4000, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
-            fprintf(stderr, "fail! mprotect\n");
-            exit(1);
-            return 1;
-        }
+        // TODO(zhuowei): map in on the fly
+        donair_map_memory(cpu, env->pc, make_memop_idx(MO_32, 0), MMU_INST_FETCH, target_task);
+        donair_map_memory(cpu, 0x400000000, make_memop_idx(MO_32, 0), MMU_DATA_LOAD, target_task);
+        donair_map_memory(cpu, env->xregs[31], make_memop_idx(MO_64, 0), MMU_DATA_STORE, target_task);
+        //donair_map_memory(cpu, env->xregs[31] - 8, make_memop_idx(MO_64, 0), MMU_DATA_STORE, target_task);
+        // TODO(zhuowei): also map the rest of the memory!
         mapped = true;
     }
     {
@@ -1146,7 +1168,8 @@ static int donair_cpu_exec(CPUState *cpu) {
             fprintf(stderr, "fail! thread_get_state\n");
             exit(1);
         }
-        // fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
+        // TODO(zhuowei): also map the memory here!
+        fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
         donair_thread_state_to_cpu_state(env, &state, donair_exception_type == EXC_BREAKPOINT? 4: 0);
         // pretend we ran a `svc` instruction
         // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
