@@ -1056,6 +1056,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     uint64_t haddr_page = haddr & ~page_mask;
     uint64_t virt_page = address & ~page_mask;
     vm_address_t target_address = virt_page;
+    // TODO(zhuowei): use the real protection from QEMU TLB
     vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
     vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
     fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
@@ -1191,9 +1192,13 @@ static int donair_cpu_exec(CPUState *cpu) {
         if (donair_exception_type == EXC_BAD_ACCESS) {
             // TODO(zhuowei): got to be a better way
             // prep it for the next time throught the loop...
-            const uint64_t esr_dabort_wnr = (1ull << 6);
             donair_exception_address = exception_state.__far;
-            donair_exception_memory_type = (exception_state.__esr & esr_dabort_wnr) != 0? MMU_DATA_STORE: MMU_DATA_LOAD;
+            if (((exception_state.__esr >> 26) & 0x3f) == 0x20) {
+                donair_exception_memory_type = MMU_INST_FETCH;
+            } else {
+                const uint64_t esr_dabort_wnr = (1ull << 6);
+                donair_exception_memory_type = (exception_state.__esr & esr_dabort_wnr) != 0? MMU_DATA_STORE: MMU_DATA_LOAD;
+            }
             // TODO(zhuowei): memop is hardcoded here
             int flags = 0;
             donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags);
