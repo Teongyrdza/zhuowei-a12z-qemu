@@ -1000,6 +1000,8 @@ static void donair_thread_state_to_cpu_state(CPUARMState* env, arm_thread_state6
     env->pc = state->__pc + pc_addend;
 }
 static exception_type_t donair_exception_type;
+static uint64_t donair_exception_address;
+static uint64_t donair_exception_memory_type;
 
 #pragma pack(4)
 typedef struct {
@@ -1010,7 +1012,7 @@ typedef struct {
     NDR_record_t NDR;
     uint32_t exception;
     uint32_t codeCnt;
-    uint32_t code[2];
+    mach_exception_data_type_t code[2];
 } exception_raise_request; // the bits we need at least
 
 typedef struct {
@@ -1027,11 +1029,7 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     donair_exception_type = req->exception; // TODO(zhuowei)
     thread_suspend(req->thread.name);
 
-    fprintf(stderr, "donair_exception_server! %x %lx exception=%x codeCnt=%x code[0]=%x code[1]=%x\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->codeCnt, req->code[0], req->code[1]);
-
-    if (req->exception != EXC_BREAKPOINT) {
-        exit(0);
-    }
+    fprintf(stderr, "donair_exception_server! %x %lx exception=%x code[0]=%llx code[1]=%llx\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->code[0], req->code[1]);
 
     // https://github.com/evelyneee/ellekit/blob/95d8baf4d8bae66f211abbe7f5503cdc980ae3f3/ellekit/ExceptionHandler/Exception.swift#L99
     exception_raise_reply* reply = (exception_raise_reply*)OutHeadP;
@@ -1134,7 +1132,7 @@ static int donair_cpu_exec(CPUState *cpu) {
 		    target_thread,
 		    EXC_MASK_BAD_ACCESS | EXC_MASK_BAD_INSTRUCTION | EXC_MASK_ARITHMETIC | EXC_MASK_BREAKPOINT,
 		    exc_port,
-		    EXCEPTION_DEFAULT,
+		    MACH_EXCEPTION_CODES | EXCEPTION_DEFAULT,
 		    ARM_THREAD_STATE64) != KERN_SUCCESS) {
             abort();
         }
@@ -1145,12 +1143,16 @@ static int donair_cpu_exec(CPUState *cpu) {
     if (!mapped) {
         // TODO(zhuowei): map in on the fly
         donair_map_memory(cpu, env->pc, make_memop_idx(MO_32, 0), MMU_INST_FETCH, target_task);
-        donair_map_memory(cpu, 0x400000000, make_memop_idx(MO_32, 0), MMU_DATA_LOAD, target_task);
         donair_map_memory(cpu, env->xregs[31], make_memop_idx(MO_64, 0), MMU_DATA_STORE, target_task);
         //donair_map_memory(cpu, env->xregs[31] - 8, make_memop_idx(MO_64, 0), MMU_DATA_STORE, target_task);
         // TODO(zhuowei): also map the rest of the memory!
         mapped = true;
     }
+    if (donair_exception_type == EXC_BAD_ACCESS) {
+        // TODO(zhuowei): map this as read/write/execute depending on QEMU tlb?
+        donair_map_memory(cpu, donair_exception_address, make_memop_idx(MO_64, 0), donair_exception_memory_type, target_task);
+    }
+    donair_exception_type = 0;
     {
         arm_thread_state64_t state;
         mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
@@ -1180,11 +1182,29 @@ static int donair_cpu_exec(CPUState *cpu) {
         // TODO(zhuowei): also map the memory here!
         fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
         donair_thread_state_to_cpu_state(env, &state, donair_exception_type == EXC_BREAKPOINT? 4: 0);
-        // pretend we ran a `svc` instruction
-        // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
-        cpu->exception_index = EXCP_SWI;
-        env->exception.target_el = 1;
-        env->exception.syndrome = syn_aa64_svc(0);
+        arm_exception_state64_t exception_state;
+        uint32_t exception_count = ARM_EXCEPTION_STATE64_COUNT;
+        if (thread_get_state(target_thread, ARM_EXCEPTION_STATE64, (thread_state_t)&exception_state, &exception_count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_get_state\n");
+            exit(1);
+        }
+        if (donair_exception_type == EXC_BAD_ACCESS) {
+            // TODO(zhuowei): got to be a better way
+            // prep it for the next time throught the loop...
+            const uint64_t esr_dabort_wnr = (1ull << 6);
+            donair_exception_address = exception_state.__far;
+            donair_exception_memory_type = (exception_state.__esr & esr_dabort_wnr) != 0? MMU_DATA_STORE: MMU_DATA_LOAD;
+            // TODO(zhuowei): memop is hardcoded here
+            int flags = 0;
+            donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags);
+            // just populate the tlb; we'll use it next go-around.
+        } else if (donair_exception_type == EXC_BREAKPOINT) {
+            // pretend we ran a `svc` instruction
+            // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
+            cpu->exception_index = EXCP_SWI;
+            env->exception.target_el = 1;
+            env->exception.syndrome = syn_aa64_svc(0);
+        }
     }
     return 0;
 }
