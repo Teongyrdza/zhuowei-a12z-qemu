@@ -1022,6 +1022,7 @@ static void donair_neon_state_to_cpu_state(CPUARMState* env, arm_neon_state64_t*
 static exception_type_t donair_exception_type;
 static uint64_t donair_exception_address;
 static uint64_t donair_exception_memory_type;
+static uint64_t donair_exception_message_address;
 
 #pragma pack(4)
 typedef struct {
@@ -1047,6 +1048,7 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     // TODO(zhuowei)
     exception_raise_request* req = (exception_raise_request*)InHeadP;
     donair_exception_type = req->exception; // TODO(zhuowei)
+    donair_exception_message_address = req->code[1];
     thread_suspend(req->thread.name);
 
     fprintf(stderr, "donair_exception_server! %x %lx exception=%x code[0]=%llx code[1]=%llx\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->code[0], req->code[1]);
@@ -1299,6 +1301,7 @@ static int donair_cpu_exec(CPUState *cpu) {
             exit(1);
         }
 
+        // fprintf(stderr, "running pc=%llx x0=%llx\n", state.__pc, state.__x[0]);
 
         if (thread_resume(target_thread) != KERN_SUCCESS) {
             fprintf(stderr, "fail! thread_resume\n");
@@ -1359,15 +1362,20 @@ static int donair_cpu_exec(CPUState *cpu) {
             donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags, &prot);
             // just populate the tlb; we'll use it next go-around.
         } else if (donair_exception_type == EXC_BREAKPOINT) {
-#define DONAIR_HYPERCALL_SET_TLS 0x12340000
-            if (state.__x[8] == DONAIR_HYPERCALL_SET_TLS) {
-                env->cp15.tpidr_el[0] = state.__x[0];
+            // pretend we ran a `svc` instruction
+            // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
+            cpu->exception_index = EXCP_SWI;
+            env->exception.target_el = 1;
+            env->exception.syndrome = syn_aa64_svc(0);
+        } else if (donair_exception_type == EXC_BAD_INSTRUCTION) {
+            if ((donair_exception_message_address & ~0x1ful) == 0xd51bd060) {
+                // msr TPIDRRO_EL0, x(?); always traps
+                env->cp15.tpidr_el[0] = env->xregs[donair_exception_message_address & 0x1f];
+                env->pc += 4;
             } else {
-                // pretend we ran a `svc` instruction
-                // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
-                cpu->exception_index = EXCP_SWI;
+                cpu->exception_index = EXCP_UDEF;
                 env->exception.target_el = 1;
-                env->exception.syndrome = syn_aa64_svc(0);
+                env->exception.syndrome = exception_state.__esr;
             }
         }
     }
