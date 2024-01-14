@@ -52,6 +52,7 @@
 #include "mach/mach_error.h"
 #include "mach/task.h"
 #include <spawn.h>
+#include "exec/cputlb.h"
 
 /* -icount align implementation. */
 
@@ -977,7 +978,7 @@ static bool donair_is_ok(CPUState *cpu) {
 }
 
 uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
-                       uintptr_t ra, MMUAccessType type, int* flags_out);
+                       uintptr_t ra, MMUAccessType type, int* flags_out, int* prot_out);
 
 extern char** environ;
 extern char* const ** _NSGetArgv(void);
@@ -1049,22 +1050,33 @@ static uint64_t donair_mapped_pages[0x1000];
 static uint64_t donair_mapped_pages_count;
 #define DONAIR_PAGE_SIZE 0x10000
 
+static void donair_unmap_memory(task_t target_task);
+
 static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx, uint32_t lookup_type, task_t target_task) {
     CPUARMState* env = cpu_env(cpu);
     // TODO(zhuowei): page size needs to be same as host...
     // TODO(zhuowei): page permissions...
     int flags = 0;
-    uint64_t haddr = donair_mmu_lookup(cpu, address, memop_idx, env->pc, lookup_type, &flags);
+    int prot = 0;
+    uint64_t haddr = donair_mmu_lookup(cpu, address, memop_idx, env->pc, lookup_type, &flags, &prot);
     fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
+
+    if (donair_mapped_pages_count == sizeof(donair_mapped_pages) / sizeof(*donair_mapped_pages)) {
+        donair_unmap_memory(target_task);
+    }
     //uint64_t page_size = PAGE_SIZE;
     uint64_t page_size = DONAIR_PAGE_SIZE;
     uint64_t page_mask = page_size - 1;
     uint64_t haddr_page = haddr & ~page_mask;
     uint64_t virt_page = address & ~page_mask;
     vm_address_t target_address = virt_page;
-    // TODO(zhuowei): use the real protection from QEMU TLB
-    vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
-    vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+
+    vm_prot_t cur_protection = VM_PROT_READ;
+    if (prot & PAGE_WRITE) {
+        cur_protection |= VM_PROT_WRITE;
+    }
+    // TODO(zhuowei): handle rwx
+    vm_prot_t max_protection = VM_PROT_DEFAULT;
     fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
     kern_return_t err = vm_remap(target_task, &target_address, page_size, /*mask=*/0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
@@ -1077,8 +1089,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     uint64_t mapped_page_index = donair_mapped_pages_count++;
     donair_mapped_pages[mapped_page_index] = address;
     // TODO(zhuowei): set permissions properly!
-    if (lookup_type == MMU_INST_FETCH) {
-        // Hack: everything is executable!
+    if (prot & PAGE_EXEC) {
         if (vm_protect(target_task, target_address, page_size, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
             fprintf(stderr, "fail! mprotect\n");
             exit(1);
@@ -1262,7 +1273,8 @@ static int donair_cpu_exec(CPUState *cpu) {
             }
             // TODO(zhuowei): memop is hardcoded here
             int flags = 0;
-            donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags);
+            int prot = 0;
+            donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags, &prot);
             // just populate the tlb; we'll use it next go-around.
         } else if (donair_exception_type == EXC_BREAKPOINT) {
             // pretend we ran a `svc` instruction
