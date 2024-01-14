@@ -1114,7 +1114,9 @@ static int donair_cpu_exec(CPUState *cpu) {
     // TODO(zhuowei): walk the pagetables, use a separate process
     static task_t target_task;
     static thread_act_t target_thread;
+#ifdef DONAIR_SEPARATE_PROCESS
     static int target_pid;
+#endif
     static mach_port_t exc_port;
     static bool mapped;
 
@@ -1126,6 +1128,7 @@ static int donair_cpu_exec(CPUState *cpu) {
         memset(&sigact, 0, sizeof(sigact));
         sigact.sa_handler = donair_do_nothing_sig;
         sigaction(SIG_IPI, &sigact, NULL);
+#ifdef DONAIR_SEPARATE_PROCESS
         posix_spawnattr_t spawnattr;
         posix_spawnattr_init(&spawnattr);
         posix_spawnattr_setflags(&spawnattr, POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT);
@@ -1152,6 +1155,12 @@ static int donair_cpu_exec(CPUState *cpu) {
         }
         // TODO(zhuowei): free?
         target_thread = threads_array[0];
+#else
+        if (thread_create(mach_task_self_, &target_thread) != KERN_SUCCESS) {
+            abort();
+        }
+        target_task = mach_task_self_;
+#endif
         if (mach_port_allocate(mach_task_self_, MACH_PORT_RIGHT_RECEIVE, &exc_port) != KERN_SUCCESS) {
             abort();
         }
@@ -1166,9 +1175,11 @@ static int donair_cpu_exec(CPUState *cpu) {
 		    ARM_THREAD_STATE64) != KERN_SUCCESS) {
             abort();
         }
+#ifdef DONAIR_SEPARATE_PROCESS
         thread_suspend(target_thread);
         fprintf(stderr, "pid %d\n", target_pid);
         task_resume(target_task);
+#endif
     }
     if (cpu->tlb_flushed) {
         fprintf(stderr, "tlb flush! %d %s %llx\n", cpu->tlb_flushed, donair_last_flush, donair_last_flush_info);
