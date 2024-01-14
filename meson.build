@@ -229,6 +229,13 @@ if targetos == 'darwin'
   if compiler.get_id() == 'gcc'
     qemu_common_flags += '-DOS_OBJECT_USE_OBJC=0'
   endif
+  # zhuowei: force SDK version = macOS 12.0 to allow use of x18
+  qemu_common_flags += '-mmacosx-version-min=12.0'
+  qemu_ldflags += '-mmacosx-version-min=12.0'
+  qemu_ldflags += '-Wl,-platform_version'
+  qemu_ldflags += '-Wl,macos'
+  qemu_ldflags += '-Wl,12.0'
+  qemu_ldflags += '-Wl,12.0'
 elif targetos == 'sunos'
   # needed for CMSG_ macros in sys/socket.h
   qemu_common_flags += '-D_XOPEN_SOURCE=600'
