@@ -990,6 +990,7 @@ static void donair_cpu_state_to_thread_state(CPUARMState* env, arm_thread_state6
     state->__sp = env->xregs[31];
     // TODO(zhuowei): other regs, fp regs??
     state->__pc = env->pc;
+    state->__cpsr = pstate_read(env);
 }
 
 static void donair_thread_state_to_cpu_state(CPUARMState* env, arm_thread_state64_t* state, uint64_t pc_addend) {
@@ -999,7 +1000,25 @@ static void donair_thread_state_to_cpu_state(CPUARMState* env, arm_thread_state6
     // TODO(zhuowei): other regs, fp regs??
     env->xregs[31] = state->__sp;
     env->pc = state->__pc + pc_addend;
+    pstate_write(env, state->__cpsr);
 }
+
+static void donair_cpu_state_to_neon_state(CPUARMState* env, arm_neon_state64_t* state) {
+    for (int i = 0; i < 32; i++) {
+        state->__v[i] = *(__uint128_t*)&env->vfp.zregs[i].d[0];
+    }
+    vfp_set_fpcr(env, state->__fpcr);
+    vfp_set_fpsr(env, state->__fpsr);
+}
+
+static void donair_neon_state_to_cpu_state(CPUARMState* env, arm_neon_state64_t* state) {
+    for (int i = 0; i < 32; i++) {
+        *(__uint128_t*)&env->vfp.zregs[i].d[0] = state->__v[i];
+    }
+    state->__fpcr = vfp_get_fpcr(env);
+    state->__fpsr = vfp_get_fpsr(env);
+}
+
 static exception_type_t donair_exception_type;
 static uint64_t donair_exception_address;
 static uint64_t donair_exception_memory_type;
@@ -1107,6 +1126,41 @@ static void donair_unmap_memory(task_t target_task) {
         }
     }
     donair_mapped_pages_count = 0;
+}
+
+static uint64_t donair_tpidrro_el0;
+
+extern void _thread_set_tsd_base(void *tsd_base);
+static void donair_set_tpidrro_el0(thread_act_t target_thread, arm_thread_state64_t* state, mach_port_t exc_port, uint64_t value) {
+    // This assumes _thread_set_tsd_base is mapped in the process
+    // TODO(zhuowei): put our own syscall handler in instead...
+    state->__pc = (uint64_t)&_thread_set_tsd_base;
+    state->__lr = 0xdead;
+    state->__x[0] = value;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_set_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)state, count) != KERN_SUCCESS) {
+        fprintf(stderr, "fail! thread_set_state\n");
+        exit(1);
+    }
+    fprintf(stderr, "about to resume: %llx\n", state->__pc);
+    if (thread_resume(target_thread) != KERN_SUCCESS) {
+        fprintf(stderr, "fail! thread_resume\n");
+        exit(1);
+    }
+    if (mach_msg_server_once(donair_exception_server, 4096, exc_port, 0) != KERN_SUCCESS) {
+        fprintf(stderr, "fail! donair_set_tpidrro_el0 mach_msg_server_once\n");
+        exit(1);
+    }
+#if 0
+    arm_exception_state64_t exception_state;
+    uint32_t exception_count = ARM_EXCEPTION_STATE64_COUNT;
+    if (thread_get_state(target_thread, ARM_EXCEPTION_STATE64, (thread_state_t)&exception_state, &exception_count) != KERN_SUCCESS) {
+        fprintf(stderr, "fail! thread_get_state\n");
+        exit(1);
+    }
+    fprintf(stderr, "set tpidrro_el0 to %llx: exception state %x %llx %llx\n", value, exception_state.__exception, exception_state.__esr, exception_state.__far);
+#endif
+    donair_tpidrro_el0 = value;
 }
 
 extern const char* donair_last_flush;
@@ -1220,11 +1274,32 @@ static int donair_cpu_exec(CPUState *cpu) {
             fprintf(stderr, "fail! thread_get_state\n");
             exit(1);
         }
+
+        if (env->cp15.tpidr_el[0] != donair_tpidrro_el0) {
+            // TODO(zhuowei): hack: tpidr_el0 redirected to tpidrro_el0
+            donair_set_tpidrro_el0(target_thread, &state, exc_port, env->cp15.tpidr_el[0]);
+        }
+
         donair_cpu_state_to_thread_state(env, &state);
         if (thread_set_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)&state, count) != KERN_SUCCESS) {
             fprintf(stderr, "fail! thread_set_state\n");
             exit(1);
         }
+
+        // TODO(zhuowei): could probably optimize to be lazy
+        arm_neon_state64_t neon_state;
+        mach_msg_type_number_t neon_count = ARM_NEON_STATE64_COUNT;
+        if (thread_get_state(target_thread, ARM_NEON_STATE64, (thread_state_t)&neon_state, &neon_count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_get_state neon\n");
+            exit(1);
+        }
+        donair_cpu_state_to_neon_state(env, &neon_state);
+        if (thread_set_state(target_thread, ARM_NEON_STATE64, (thread_state_t)&neon_state, neon_count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_set_state neon\n");
+            exit(1);
+        }
+
+
         if (thread_resume(target_thread) != KERN_SUCCESS) {
             fprintf(stderr, "fail! thread_resume\n");
             exit(1);
@@ -1252,9 +1327,16 @@ static int donair_cpu_exec(CPUState *cpu) {
             fprintf(stderr, "fail! thread_get_state\n");
             exit(1);
         }
+
+        if (thread_get_state(target_thread, ARM_NEON_STATE64, (thread_state_t)&neon_state, &neon_count) != KERN_SUCCESS) {
+            fprintf(stderr, "fail! thread_get_state neon\n");
+            exit(1);
+        }
+
         // TODO(zhuowei): also map the memory here!
         fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
         donair_thread_state_to_cpu_state(env, &state, donair_exception_type == EXC_BREAKPOINT? 4: 0);
+        donair_neon_state_to_cpu_state(env, &neon_state);
         arm_exception_state64_t exception_state;
         uint32_t exception_count = ARM_EXCEPTION_STATE64_COUNT;
         if (thread_get_state(target_thread, ARM_EXCEPTION_STATE64, (thread_state_t)&exception_state, &exception_count) != KERN_SUCCESS) {
@@ -1277,11 +1359,16 @@ static int donair_cpu_exec(CPUState *cpu) {
             donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags, &prot);
             // just populate the tlb; we'll use it next go-around.
         } else if (donair_exception_type == EXC_BREAKPOINT) {
-            // pretend we ran a `svc` instruction
-            // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
-            cpu->exception_index = EXCP_SWI;
-            env->exception.target_el = 1;
-            env->exception.syndrome = syn_aa64_svc(0);
+#define DONAIR_HYPERCALL_SET_TLS 0x12340000
+            if (state.__x[8] == DONAIR_HYPERCALL_SET_TLS) {
+                env->cp15.tpidr_el[0] = state.__x[0];
+            } else {
+                // pretend we ran a `svc` instruction
+                // TODO(zhuowei): occationally this exception isn't picked up? It skips past the exit() instruction?!
+                cpu->exception_index = EXCP_SWI;
+                env->exception.target_el = 1;
+                env->exception.syndrome = syn_aa64_svc(0);
+            }
         }
     }
     return 0;
