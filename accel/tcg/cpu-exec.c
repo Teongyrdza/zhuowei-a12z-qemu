@@ -968,6 +968,12 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 #endif
 }
 
+#ifdef DONAIR_DEBUG_PRINT
+#define donair_fprintf(...) fprintf(__VA_ARGS__)
+#else
+#define donair_fprintf(...)
+#endif /* DONAIR_DEBUG */
+
 // zhuowei
 void helper_stq_mmu(CPUArchState *env, uint64_t addr, uint64_t val,
                     MemOpIdx oi, uintptr_t retaddr);
@@ -1051,7 +1057,7 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     donair_exception_message_address = req->code[1];
     thread_suspend(req->thread.name);
 
-    fprintf(stderr, "donair_exception_server! %x %lx exception=%x code[0]=%llx code[1]=%llx\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->code[0], req->code[1]);
+    donair_fprintf(stderr, "donair_exception_server! %x %lx exception=%x code[0]=%llx code[1]=%llx\n", req->Head.msgh_size, sizeof(exception_raise_request), req->exception, req->code[0], req->code[1]);
 
     // https://github.com/evelyneee/ellekit/blob/95d8baf4d8bae66f211abbe7f5503cdc980ae3f3/ellekit/ExceptionHandler/Exception.swift#L99
     exception_raise_reply* reply = (exception_raise_reply*)OutHeadP;
@@ -1080,7 +1086,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     int flags = 0;
     int prot = 0;
     uint64_t haddr = donair_mmu_lookup(cpu, address, memop_idx, env->pc, lookup_type, &flags, &prot);
-    fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
+    donair_fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
 
     if (donair_mapped_pages_count == sizeof(donair_mapped_pages) / sizeof(*donair_mapped_pages)) {
         donair_unmap_memory(target_task);
@@ -1098,7 +1104,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     }
     // TODO(zhuowei): handle rwx
     vm_prot_t max_protection = VM_PROT_DEFAULT;
-    fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
+    donair_fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
     kern_return_t err = vm_remap(target_task, &target_address, page_size, /*mask=*/0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
             &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
@@ -1144,7 +1150,7 @@ static void donair_set_tpidrro_el0(thread_act_t target_thread, arm_thread_state6
         fprintf(stderr, "fail! thread_set_state\n");
         exit(1);
     }
-    fprintf(stderr, "about to resume: %llx\n", state->__pc);
+    donair_fprintf(stderr, "about to resume: %llx\n", state->__pc);
     if (thread_resume(target_thread) != KERN_SUCCESS) {
         fprintf(stderr, "fail! thread_resume\n");
         exit(1);
@@ -1337,7 +1343,7 @@ static int donair_cpu_exec(CPUState *cpu) {
         }
 
         // TODO(zhuowei): also map the memory here!
-        fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8]);
+        donair_fprintf(stderr, "new PC: %llx x0: %llx x1: %llx x2: %llx x8: %llx lr: %llx\n", state.__pc, state.__x[0], state.__x[1], state.__x[2], state.__x[8], state.__lr);
         donair_thread_state_to_cpu_state(env, &state, donair_exception_type == EXC_BREAKPOINT? 4: 0);
         donair_neon_state_to_cpu_state(env, &neon_state);
         arm_exception_state64_t exception_state;
@@ -1359,6 +1365,7 @@ static int donair_cpu_exec(CPUState *cpu) {
             // TODO(zhuowei): memop is hardcoded here
             int flags = 0;
             int prot = 0;
+            // fprintf(stderr, "a fault: doing donair_mmu_lookup %x, %llx, %llx, %llx\n", exception_state.__esr, donair_exception_address, env->pc, donair_exception_memory_type);
             donair_mmu_lookup(cpu, donair_exception_address, make_memop_idx(MO_64, 0), env->pc, donair_exception_memory_type, &flags, &prot);
             // just populate the tlb; we'll use it next go-around.
         } else if (donair_exception_type == EXC_BREAKPOINT) {
