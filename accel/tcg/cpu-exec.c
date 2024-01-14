@@ -1044,6 +1044,11 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
     return KERN_SUCCESS;
 }
 
+// TODO(zhuowei): find a better way to do this
+static uint64_t donair_mapped_pages[0x1000];
+static uint64_t donair_mapped_pages_count;
+#define DONAIR_PAGE_SIZE 0x10000
+
 static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx, uint32_t lookup_type, task_t target_task) {
     CPUARMState* env = cpu_env(cpu);
     // TODO(zhuowei): page size needs to be same as host...
@@ -1051,7 +1056,8 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     int flags = 0;
     uint64_t haddr = donair_mmu_lookup(cpu, address, memop_idx, env->pc, lookup_type, &flags);
     fprintf(stderr, "translated! %llx %x\n", haddr, *(uint32_t*)haddr);
-    uint64_t page_size = PAGE_SIZE;
+    //uint64_t page_size = PAGE_SIZE;
+    uint64_t page_size = DONAIR_PAGE_SIZE;
     uint64_t page_mask = page_size - 1;
     uint64_t haddr_page = haddr & ~page_mask;
     uint64_t virt_page = address & ~page_mask;
@@ -1060,7 +1066,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     vm_prot_t cur_protection = VM_PROT_READ | VM_PROT_WRITE;
     vm_prot_t max_protection = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
     fprintf(stderr, "%lx %llx\n", target_address, haddr_page);
-    kern_return_t err = vm_remap(target_task, &target_address, 0x4000, /*mask=*/0,
+    kern_return_t err = vm_remap(target_task, &target_address, page_size, /*mask=*/0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
             &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
     if (err != KERN_SUCCESS) {
@@ -1068,10 +1074,12 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
         exit(1);
         return 1;
     }
+    uint64_t mapped_page_index = donair_mapped_pages_count++;
+    donair_mapped_pages[mapped_page_index] = address;
     // TODO(zhuowei): set permissions properly!
     if (lookup_type == MMU_INST_FETCH) {
         // Hack: everything is executable!
-        if (vm_protect(target_task, target_address, 0x4000, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
+        if (vm_protect(target_task, target_address, page_size, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
             fprintf(stderr, "fail! mprotect\n");
             exit(1);
             return 1;
@@ -1079,6 +1087,19 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     }
     return 0;
 }
+
+static void donair_unmap_memory(task_t target_task) {
+    for (int i = 0; i < donair_mapped_pages_count; i++) {
+        if (vm_deallocate(target_task, donair_mapped_pages[i], DONAIR_PAGE_SIZE) != 0) {
+            fprintf(stderr, "fail! donair_unmap_memory\n");
+            exit(1);
+        }
+    }
+    donair_mapped_pages_count = 0;
+}
+
+extern const char* donair_last_flush;
+extern uint64_t donair_last_flush_info;
 
 static int donair_cpu_exec(CPUState *cpu) {
     // fprintf(stderr, "donair_cpu_exec!\n");
@@ -1140,6 +1161,14 @@ static int donair_cpu_exec(CPUState *cpu) {
         thread_suspend(target_thread);
         fprintf(stderr, "pid %d\n", target_pid);
         task_resume(target_task);
+    }
+    if (cpu->tlb_flushed) {
+        fprintf(stderr, "tlb flush! %d %s %llx\n", cpu->tlb_flushed, donair_last_flush, donair_last_flush_info);
+        cpu->tlb_flushed = false;
+        donair_last_flush = NULL;
+        donair_last_flush_info = 0;
+        donair_unmap_memory(target_task);
+        mapped = false;
     }
     if (!mapped) {
         // TODO(zhuowei): map in on the fly

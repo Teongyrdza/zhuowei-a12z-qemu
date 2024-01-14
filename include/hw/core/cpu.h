@@ -565,6 +565,9 @@ struct CPUState {
     /* Used for user-only emulation of prctl(PR_SET_UNALIGN). */
     bool prctl_unalign_sigbus;
 
+    // TODO(zhuowei): find a better way to track TLB flushes
+    bool tlb_flushed;
+
     /* track IOMMUs whose translations we've cached in the TCG TLB */
     GArray *iommu_notifiers;
 

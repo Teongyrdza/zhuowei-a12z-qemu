@@ -44,6 +44,8 @@
 #include "tcg/tcg-ldst.h"
 #include "tcg/oversized-guest.h"
 
+#include <execinfo.h>
+
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
 /* #define DEBUG_TLB_LOG */
@@ -242,6 +244,9 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     memset(desc->vtable, -1, sizeof(desc->vtable));
 }
 
+const char* donair_last_flush;
+uint64_t donair_last_flush_info;
+
 static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
                                         int64_t now)
 {
@@ -250,6 +255,11 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
+    // TODO(zhuowei): there's got to be a better way
+    //fprintf(stderr, "tlb_flush_one_mmuidx_locked %d\n", mmu_idx);
+    cpu->tlb_flushed = true;
+    donair_last_flush = "tlb_flush_one_mmuidx_locked";
+    donair_last_flush_info = mmu_idx;
 }
 
 static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
@@ -376,6 +386,12 @@ void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
 
 void tlb_flush(CPUState *cpu)
 {
+#if 0
+    fprintf(stderr, "tlb_flush\n");
+    void* backtrace_addrs[0x10];
+    int backtrace_out = backtrace(backtrace_addrs, sizeof(backtrace_addrs) / sizeof(backtrace_addrs[0]));
+    backtrace_symbols_fd(backtrace_addrs, backtrace_out, STDERR_FILENO);
+#endif
     tlb_flush_by_mmuidx(cpu, ALL_MMUIDX_BITS);
 }
 
@@ -490,6 +506,11 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
         }
         tlb_flush_vtlb_page_locked(cpu, midx, page);
     }
+    // TODO(zhuowei): for donair - there's got to be a better way to sync tlb checks
+    // fprintf(stderr, "tlb_flush_page_locked %d %llx\n", midx, page);
+    cpu->tlb_flushed = true;
+    donair_last_flush = "tlb_flush_page_locked";
+    donair_last_flush_info = page;
 }
 
 /**
