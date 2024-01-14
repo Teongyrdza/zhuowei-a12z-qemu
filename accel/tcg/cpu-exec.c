@@ -1097,31 +1097,34 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     uint64_t haddr_page = haddr & ~page_mask;
     uint64_t virt_page = address & ~page_mask;
     vm_address_t target_address = virt_page;
-
-    vm_prot_t cur_protection = VM_PROT_READ;
-    if (prot & PAGE_WRITE) {
-        cur_protection |= VM_PROT_WRITE;
-    }
-    // TODO(zhuowei): handle rwx
-    vm_prot_t max_protection = VM_PROT_DEFAULT;
     donair_log("%lx %llx\n", target_address, haddr_page);
+    vm_prot_t unused_cur_protection = 0;
+    vm_prot_t unused_max_protection = 0;
     kern_return_t err = vm_remap(target_task, &target_address, page_size, /*mask=*/0,
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
-            &cur_protection, &max_protection, VM_INHERIT_DEFAULT);
+            &unused_cur_protection, &unused_max_protection, VM_INHERIT_DEFAULT);
     if (err != KERN_SUCCESS) {
         fprintf(stderr, "fail! %s\n", mach_error_string(err));
         exit(1);
         return 1;
     }
+
     uint64_t mapped_page_index = donair_mapped_pages_count++;
     donair_mapped_pages[mapped_page_index] = address;
-    // TODO(zhuowei): set permissions properly!
+
+    vm_prot_t target_protection = VM_PROT_READ;
+    if (prot & PAGE_WRITE) {
+        target_protection |= VM_PROT_WRITE;
+    }
     if (prot & PAGE_EXEC) {
-        if (vm_protect(target_task, target_address, page_size, /*set_maximum=*/false, VM_PROT_READ | VM_PROT_EXECUTE) != 0) {
-            fprintf(stderr, "fail! mprotect\n");
-            exit(1);
-            return 1;
-        }
+        target_protection |= VM_PROT_EXECUTE;
+    }
+    // TODO(zhuowei): handle rwx
+    if (vm_protect(target_task, target_address, page_size, /*set_maximum=*/false, target_protection) != 0) {
+        fprintf(stderr, "fail! mprotect\n");
+        sleep(10000);
+        exit(1);
+        return 1;
     }
     return 0;
 }
@@ -1262,6 +1265,8 @@ static int donair_cpu_exec(CPUState *cpu) {
         donair_last_flush_info = 0;
         donair_unmap_memory(target_task);
         mapped = false;
+        // TODO(zhuowei): should it?
+        donair_exception_type = 0;
     }
     if (!mapped) {
         // TODO(zhuowei): map in on the fly
