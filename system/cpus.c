@@ -439,11 +439,11 @@ void qemu_wait_io_event(CPUState *cpu)
 
 void cpus_kick_thread(CPUState *cpu)
 {
+    // fprintf(stderr, "qemu: kick!\n");
     if (cpu->thread_kicked) {
         return;
     }
     cpu->thread_kicked = true;
-
 #ifndef _WIN32
     int err = pthread_kill(cpu->thread->thread, SIG_IPI);
     if (err && err != ESRCH) {
@@ -457,6 +457,7 @@ void cpus_kick_thread(CPUState *cpu)
 
 void qemu_cpu_kick(CPUState *cpu)
 {
+    // fprintf(stderr, "qemu_cpu_kick\n");
     qemu_cond_broadcast(cpu->halt_cond);
     if (cpus_accel->kick_vcpu_thread) {
         cpus_accel->kick_vcpu_thread(cpu);

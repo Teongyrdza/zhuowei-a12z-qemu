@@ -128,6 +128,8 @@ static void *mttcg_cpu_thread_fn(void *arg)
 void mttcg_kick_vcpu_thread(CPUState *cpu)
 {
     cpu_exit(cpu);
+    // TODO(zhuowei): hax
+    cpus_kick_thread(cpu);
 }
 
 void mttcg_start_vcpu_thread(CPUState *cpu)

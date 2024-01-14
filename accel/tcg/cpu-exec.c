@@ -1101,6 +1101,10 @@ static void donair_unmap_memory(task_t target_task) {
 extern const char* donair_last_flush;
 extern uint64_t donair_last_flush_info;
 
+static void donair_do_nothing_sig(int sig){
+    //abort();
+}
+
 static int donair_cpu_exec(CPUState *cpu) {
     // fprintf(stderr, "donair_cpu_exec!\n");
     // extremely dumb:
@@ -1118,6 +1122,10 @@ static int donair_cpu_exec(CPUState *cpu) {
 
     if (!target_task) {
         // TODO(zhuowei): setsid this so that it gets sighup'd on our exit
+        struct sigaction sigact;
+        memset(&sigact, 0, sizeof(sigact));
+        sigact.sa_handler = donair_do_nothing_sig;
+        sigaction(SIG_IPI, &sigact, NULL);
         posix_spawnattr_t spawnattr;
         posix_spawnattr_init(&spawnattr);
         posix_spawnattr_setflags(&spawnattr, POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT);
@@ -1200,9 +1208,22 @@ static int donair_cpu_exec(CPUState *cpu) {
             exit(1);
         }
         // TODO(zhuowei): is this right?
-        if (mach_msg_server_once(donair_exception_server, 4096, exc_port, 0) != KERN_SUCCESS) {
-            fprintf(stderr, "fail! mach_msg_server_once\n");
-            exit(1);
+        {
+            // TODO(zhuowei): handle interruptions outside of this method
+            // TODO(zhuowei): I think this races? maybe a kevent poll would work better.
+            sigset_t mysigset = 0;
+            sigemptyset(&mysigset);
+            sigaddset(&mysigset, SIG_IPI);
+            pthread_sigmask(SIG_UNBLOCK, &mysigset, NULL);
+            kern_return_t err = mach_msg_server_once(donair_exception_server, 4096, exc_port, MACH_RCV_INTERRUPT);
+            if (err == MACH_RCV_INTERRUPTED) {
+                // fprintf(stderr, "thread kicked\n");
+                thread_suspend(target_thread);
+            } else if (err != KERN_SUCCESS) {
+                fprintf(stderr, "fail! mach_msg_server_once %s\n", mach_error_string(err));
+                exit(1);
+            }
+            pthread_sigmask(SIG_BLOCK, &mysigset, NULL);
         }
         // fprintf(stderr, "%x\n", donair_exception_type);
         if (thread_get_state(target_thread, ARM_THREAD_STATE64, (thread_state_t)&state, &count) != KERN_SUCCESS) {
