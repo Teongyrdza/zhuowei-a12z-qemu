@@ -1110,7 +1110,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
     }
 
     uint64_t mapped_page_index = donair_mapped_pages_count++;
-    donair_mapped_pages[mapped_page_index] = address;
+    donair_mapped_pages[mapped_page_index] = virt_page;
 
     vm_prot_t target_protection = VM_PROT_READ;
     if (prot & PAGE_WRITE) {
@@ -1259,7 +1259,7 @@ static int donair_cpu_exec(CPUState *cpu) {
 #endif
     }
     if (cpu->tlb_flushed) {
-        fprintf(stderr, "tlb flush! %d %s %llx\n", cpu->tlb_flushed, donair_last_flush, donair_last_flush_info);
+        donair_log("tlb flush! %d %s %llx\n", cpu->tlb_flushed, donair_last_flush, donair_last_flush_info);
         cpu->tlb_flushed = false;
         donair_last_flush = NULL;
         donair_last_flush_info = 0;
