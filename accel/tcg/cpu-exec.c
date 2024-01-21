@@ -968,8 +968,9 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 #endif
 }
 
+#define donair_dlog(format, ...) fprintf(stderr, "[DONAIR] " format __VA_OPT__(,) __VA_ARGS__)
 #ifdef DONAIR_DEBUG_PRINT
-#define donair_log(format, ...) fprintf(stderr, "[DONAIR] " format __VA_OPT__(,) __VA_ARGS__)
+#define donair_log donair_dlog
 #else
 #define donair_log(format, ...)
 #endif /* DONAIR_DEBUG */
@@ -1075,7 +1076,8 @@ static boolean_t donair_exception_server(mach_msg_header_t *InHeadP, mach_msg_he
 // TODO(zhuowei): find a better way to do this
 static uint64_t donair_mapped_pages[0x1000];
 static uint64_t donair_mapped_pages_count;
-#define DONAIR_PAGE_SIZE 0x10000
+
+static uint64_t donair_page_size;
 
 static void donair_unmap_memory(task_t target_task);
 
@@ -1092,7 +1094,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
         donair_unmap_memory(target_task);
     }
     //uint64_t page_size = PAGE_SIZE;
-    uint64_t page_size = DONAIR_PAGE_SIZE;
+    uint64_t page_size = donair_page_size;
     uint64_t page_mask = page_size - 1;
     uint64_t haddr_page = haddr & ~page_mask;
     uint64_t virt_page = address & ~page_mask;
@@ -1104,7 +1106,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
             VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self_, haddr_page, /*copy=*/false,
             &unused_cur_protection, &unused_max_protection, VM_INHERIT_DEFAULT);
     if (err != KERN_SUCCESS) {
-        fprintf(stderr, "fail! %s\n", mach_error_string(err));
+        fprintf(stderr, "fail! %llx %llx %s\n", virt_page, haddr_page, mach_error_string(err));
         exit(1);
         return 1;
     }
@@ -1132,7 +1134,7 @@ static int donair_map_memory(CPUState* cpu, uint64_t address, MemOpIdx memop_idx
 static void donair_unmap_memory(task_t target_task) {
     for (int i = 0; i < donair_mapped_pages_count; i++) {
         // donair_log("deallocating %llx\n", donair_mapped_pages[i]);
-        if (vm_deallocate(target_task, donair_mapped_pages[i], DONAIR_PAGE_SIZE) != 0) {
+        if (vm_deallocate(target_task, donair_mapped_pages[i], donair_page_size) != 0) {
             fprintf(stderr, "fail! donair_unmap_memory\n");
             exit(1);
         }
@@ -1200,6 +1202,18 @@ static int donair_cpu_exec(CPUState *cpu) {
     CPUARMState* env = cpu_env(cpu);
 
     if (!target_task) {
+        {
+            // TODO(zhuowei): call aa64_va_parameters
+            uint32_t gran = (env->cp15.tcr_el[1] >> 14) & 0x3;
+            if (gran == 0x2) {
+                donair_page_size = 0x4000;
+            } else if (gran == 0x1) {
+                donair_page_size = 0x10000;
+            } else {
+                fprintf(stderr, "page size not supported by donair\n");
+                exit(1);
+            }
+        }
         // TODO(zhuowei): setsid this so that it gets sighup'd on our exit
         struct sigaction sigact;
         memset(&sigact, 0, sizeof(sigact));
@@ -1391,6 +1405,10 @@ static int donair_cpu_exec(CPUState *cpu) {
                 syscall_name = "clone";
             } else if (syscall_number == 172) {
                 syscall_name = "getpid";
+            } else if (syscall_number == 63) {
+                syscall_name = "read";
+            } else if (syscall_number == 64) {
+                syscall_name = "write";
             }
             donair_log("SYSCALL! type=%d name=%s\n", syscall_number, syscall_name);
 #endif

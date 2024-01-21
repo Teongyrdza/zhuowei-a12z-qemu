@@ -3034,8 +3034,7 @@ uint64_t donair_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     MMULookupLocals l;
     bool crosspage = mmu_lookup(cpu, addr, oi, ra, type, &l);
     if (crosspage) {
-        fprintf(stderr, "unaligned?!\n");
-        abort();
+        fprintf(stderr, "unaligned?! %llx not handling correctly...\n", addr);
     }
     *flags_out = l.page[0].flags;
     *prot_out = l.page[0].full->prot;
