@@ -744,7 +744,7 @@ static void create_gic(VirtMachineState *vms)
         sysbus_connect_irq(gicbusdev, i + 3 * smp_cpus,
                            qdev_get_gpio_in(cpudev, ARM_CPU_VFIQ));
         // zhuowei: hack: also wire timer to FIQ to match t8015
-        qdev_connect_gpio_out(cpudev, GTIMER_PHYS, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
+        qdev_connect_gpio_out(cpudev, GTIMER_VIRT, qdev_get_gpio_in(cpudev, ARM_CPU_FIQ));
     }
 
     fdt_add_gic_node(vms);
